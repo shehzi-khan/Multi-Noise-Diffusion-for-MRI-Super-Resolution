@@ -15,6 +15,41 @@ def _warmup_beta(linear_start, linear_end, n_timestep, warmup_frac):
         linear_start, linear_end, warmup_time, dtype=np.float64)
     return betas
 
+# make_multi_noise_schedule is simpler than make_beta_schedule because:
+# 1. **Fixed Segments**: Each noise type (Poisson, Rician, Gaussian) is applied in predefined segments,
+#    making it unnecessary to compute values for every timestep individually.
+# 2. **Simple Noise Parameters**: Each noise segment has straightforward intensity ranges with basic
+#    linear interpolation, without complex transformations like cosine or quadratic schedules.
+# 3. **Single Use Case**: This function is designed specifically for Brain MRI applications, so it doesn’t
+#    need the flexibility to handle various schedule types or noise types beyond MRI needs.
+# Overall, this focused, sequential approach allows make_multi_noise_schedule to be more streamlined 
+# than the generalized make_beta_schedule function.
+
+
+def make_multi_noise_schedule(n_timestep, poisson_steps=500, rician_steps=1000, gaussian_steps=2000,
+                              intensity_poisson=(0.1, 0.5), intensity_rician=(0.05, 0.2), intensity_gaussian=(0.01, 0.1)):
+    """
+    Creates a noise schedule where different noise types are applied at different stages.
+    :param n_timestep: Total number of timesteps in the diffusion process.
+    :param poisson_steps: Number of initial steps with Poisson noise.
+    :param rician_steps: Number of intermediate steps with Rician noise.
+    :param gaussian_steps: Remaining steps with Gaussian noise.
+    """
+    betas = np.zeros(n_timestep, dtype=np.float64)
+
+    # Poisson noise stage
+    betas[:poisson_steps] = np.linspace(intensity_poisson[0], intensity_poisson[1], poisson_steps, dtype=np.float64)
+
+    # Rician noise stage
+    betas[poisson_steps:poisson_steps + rician_steps] = np.linspace(intensity_rician[0], intensity_rician[1], rician_steps, dtype=np.float64)
+
+    # Gaussian noise stage
+    gaussian_start = poisson_steps + rician_steps
+    betas[gaussian_start:gaussian_start + gaussian_steps] = np.linspace(intensity_gaussian[0], intensity_gaussian[1], gaussian_steps, dtype=np.float64)
+
+    return betas
+
+
 
 def make_beta_schedule(schedule, n_timestep, linear_start=1e-4, linear_end=2e-2, cosine_s=8e-3):
     if schedule == 'quad':
@@ -105,11 +140,24 @@ class GaussianDiffusion(nn.Module):
 
     def set_new_noise_schedule(self, schedule_opt, device):
         to_torch = partial(torch.tensor, dtype=torch.float32, device=device)
-        betas = make_beta_schedule(
-            schedule=schedule_opt['schedule'],
+        if schedule_opt['schedule'] == 'multi_noise':
+        betas = make_multi_noise_schedule(
             n_timestep=schedule_opt['n_timestep'],
-            linear_start=schedule_opt['linear_start'],
-            linear_end=schedule_opt['linear_end'])
+            poisson_steps=schedule_opt.get('poisson_steps', 500),
+            rician_steps=schedule_opt.get('rician_steps', 1000),
+            gaussian_steps=schedule_opt.get('gaussian_steps', 2000),
+            intensity_poisson=schedule_opt.get('intensity_poisson', (0.1, 0.5)),
+            intensity_rician=schedule_opt.get('intensity_rician', (0.05, 0.2)),
+            intensity_gaussian=schedule_opt.get('intensity_gaussian', (0.01, 0.1))
+            )
+        else:
+            betas = make_beta_schedule(
+                schedule=schedule_opt['schedule'],
+                n_timestep=schedule_opt['n_timestep'],
+                linear_start=schedule_opt['linear_start'],
+                linear_end=schedule_opt['linear_end']
+            )
+
         betas = betas.detach().cpu().numpy() if isinstance(betas, torch.Tensor) else betas
         alphas = 1. - betas
         alphas_cumprod = np.cumprod(alphas, axis=0)
@@ -257,23 +305,25 @@ class GaussianDiffusion(nn.Module):
         return img
 
     def q_sample(self, x_start, t, noise=None):
-        noise = default(noise, lambda: torch.randn_like(x_start))
+    noise = default(noise, lambda: torch.randn_like(x_start))
 
-        # fix gama
-        return (
-            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
-            extract(self.sqrt_one_minus_alphas_cumprod,
-                    t, x_start.shape) * noise
-        )
-        # random gama
-        # x_shape = x_start.shape
-        # l = self.alphas_cumprod .gather(-1, t)
-        # r = self.alphas_cumprod .gather(-1, t+1)
-        # gama = (r - l) * torch.rand(0, 1) + l
-        # gama = gama.reshape(t.shape[0], *((1,) * (len(x_shape) - 1)))
-        # return (
-        #     nq.sqrt(gama) * x_start + nq.sqrt(1-gama)* noise
-        # )
+    if t < self.poisson_steps:
+        # Apply Poisson noise characteristics
+        noise = torch.poisson(x_start * self.poisson_intensity).float() / self.poisson_intensity
+    elif t < self.poisson_steps + self.rician_steps:
+        # Apply Rician noise characteristics
+        real_part = x_start + noise * self.rician_intensity
+        imag_part = noise * self.rician_intensity
+        noise = torch.sqrt(real_part**2 + imag_part**2)
+    # Gaussian noise in remaining steps
+    else:
+        noise = noise * self.gaussian_intensity
+
+    return (
+        extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
+        extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+    )
+
 
     def p_losses(self, x_in, noise=None):
         x_start = x_in['HR']
